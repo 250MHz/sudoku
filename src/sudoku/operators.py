@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 
 import numpy as np
+from numba import njit
 from pymoo.core.crossover import Crossover
 from pymoo.core.mutation import Mutation
 from pymoo.core.population import Population
@@ -117,6 +118,240 @@ class SwapReinitMutation(Mutation):
                     grid[r, ~A[r]] = missing_numbers
             Y[i] = grid.flatten()
         return Y
+
+
+@njit
+def column_local_search(
+    grid: np.ndarray,
+    given_mask: np.ndarray,
+    N: int,
+    exhaustive: bool = False,
+    strict: bool = True,
+):
+    """Wang et al.'s Algorithm 3 simply iterates through illegal columns,
+    for each one we randomly select another one, if no swap is possible
+    then we go to the next iteration.
+    By default, we follow this behavior.
+    Set `exhaustive` to True if you instead want it to stay
+    in the iteration until we can do a swap.
+
+    The paper is ambiguous as to whether a swap should only be allowed
+    if repeat numbers don't appear in both columns.
+    The text and the pseudocode says this, but Figure 6 shows a swap
+    occurring even though the number being swapped already exists.
+    Set `strict` to False to match Figure 6's behavior.
+    """
+    # tallies[c, val] is count of val in column c
+    tallies = np.zeros((N, N + 1), dtype=np.int32)
+    for r in range(N):
+        for c in range(N):
+            tallies[c, grid[r, c]] += 1
+
+    illegal_cols = np.zeros(N, dtype=np.int32)
+    num_illegal = 0
+    for c in range(N):
+        for val in range(1, N + 1):
+            if tallies[c, val] > 1:
+                illegal_cols[num_illegal] = c
+                num_illegal += 1
+                break
+
+    if num_illegal < 2:
+        return grid
+
+    for idx_j in range(num_illegal):
+        j = illegal_cols[idx_j]
+        found_swap = False
+        search_order = np.arange(num_illegal)
+        np.random.shuffle(search_order)
+        for idx_k in search_order:
+            k = illegal_cols[idx_k]
+            if k == j:
+                continue
+            for r in range(N):
+                if given_mask[r, j] or given_mask[r, k]:
+                    continue
+                val_j = grid[r, j]
+                val_k = grid[r, k]
+                if (
+                    tallies[j, val_j] > 1
+                    and tallies[k, val_k] > 1
+                    and (
+                        not strict
+                        or (tallies[j, val_k] == 0 and tallies[k, val_j] == 0)
+                    )
+                ):
+                    grid[r, j], grid[r, k] = val_k, val_j
+                    tallies[j, val_j] -= 1
+                    tallies[j, val_k] += 1
+                    tallies[k, val_k] -= 1
+                    tallies[k, val_j] += 1
+                    found_swap = True
+                    break
+            if not exhaustive or found_swap:
+                break
+    return grid
+
+
+@njit
+def subblock_local_search(
+    grid: np.ndarray,
+    given_mask: np.ndarray,
+    N: int,
+    sqrt_N: int,
+    greedier: bool = False,
+    exhaustive: bool = False,
+    strict: bool = True,
+):
+    """Wang et al.'s Algorithm 3 just matches a random illegal sub-block
+    with another one.
+    Unless the sub-blocks are in the same sub-block row,
+    no swaps are possible.
+    We do this by default, but setting `greedier = True` means we'll
+    only pair an illegal sub-block with another one in the same row.
+
+    The paper simply iterates through illegal sub-blocks,
+    for each one we randomly select another one, if no swap is possible
+    then we go to the next iteration.
+    By default, we follow this behavior.
+    Set `exhaustive` to True if you instead want it to stay
+    in the iteration until we can do a swap.
+
+    Unlike column local search, the paper isn't ambiguous about
+    only allowing a swap if the numbers being swapped don't exist
+    in the destination sub-block.
+    `strict` can be set to False if you want the swap to be allowed
+    even if the numbers being swapped are already there.
+    """
+    # tallies[r, c, val] is count of val in sub-block row r, c-th sub-block
+    tallies = np.zeros((sqrt_N, sqrt_N, N + 1), dtype=np.int32)
+    for r in range(N):
+        for c in range(N):
+            br1, bc = r // sqrt_N, c // sqrt_N
+            tallies[br1, bc, grid[r, c]] += 1
+
+    illegal_blocks = []
+    for br1 in range(sqrt_N):
+        for bc in range(sqrt_N):
+            for val in range(1, N + 1):
+                if tallies[br1, bc, val] > 1:
+                    illegal_blocks.append((br1, bc))
+                    break
+
+    num_illegal = len(illegal_blocks)
+    if num_illegal < 2:
+        return grid
+
+    for i in range(num_illegal):
+        br1, bc1 = illegal_blocks[i]
+        found_swap = False
+
+        candidates = []
+        for j in range(num_illegal):
+            if i == j:
+                continue
+            br2, bc2 = illegal_blocks[j]
+            if greedier and br1 != br2:
+                continue
+            candidates.append((br2, bc2))
+
+        if len(candidates) == 0:
+            continue
+
+        np.random.shuffle(np.array(candidates))
+
+        for br2, bc2 in candidates:
+            if br1 != br2:
+                if not exhaustive:
+                    break
+                continue
+
+            # Loop through actual rows
+            for r_offset in range(sqrt_N):
+                r = br1 * sqrt_N + r_offset
+                # Loop through columns of row r, for sub-block 1
+                for c1_offset in range(sqrt_N):
+                    c1 = bc1 * sqrt_N + c1_offset
+                    if given_mask[r, c1]:
+                        continue
+                    # Loop through columns of row r, for sub-block 2
+                    for c2_offset in range(sqrt_N):
+                        c2 = bc2 * sqrt_N + c2_offset
+                        if given_mask[r, c2]:
+                            continue
+
+                        val1, val2 = grid[r, c1], grid[r, c2]
+
+                        if (
+                            tallies[br1, bc1, val1] > 1
+                            and tallies[br1, bc2, val2] > 1
+                            and (
+                                not strict
+                                or (
+                                    tallies[br1, bc1, val2] == 0
+                                    and tallies[br1, bc2, val1] == 0
+                                )
+                            )
+                        ):
+                            grid[r, c1], grid[r, c2] = val2, val1
+                            tallies[br1, bc1, val1] -= 1
+                            tallies[br1, bc1, val2] += 1
+                            tallies[br1, bc2, val2] -= 1
+                            tallies[br1, bc2, val1] += 1
+                            found_swap = True
+                            break
+                    if found_swap:
+                        break
+                if found_swap:
+                    break
+            if not exhaustive or found_swap:
+                break
+    return grid
+
+
+class LocalSearchRepairV2(Repair):
+    def __init__(
+        self, greedier: bool = False, exhaustive: bool = False, strict: bool = True
+    ):
+        super().__init__()
+        self.greedier = greedier
+        self.exhaustive = exhaustive
+        self.strict = strict
+
+    def _do(
+        self,
+        problem: "SudokuProblem",
+        X: np.ndarray,
+        random_state: np.random.Generator = None,
+        **kwargs,
+    ):
+        N = problem.N
+        sqrt_N = int(np.sqrt(N))
+        A = problem.associated_matrix
+        if random_state is not None:
+            seed = random_state.integers(0, 1000000)
+            LocalSearchRepairV2._seed_numba(seed)
+        for i in range(len(X)):
+            grid = X[i].reshape((N, N))
+            grid = column_local_search(
+                grid.copy(), A, N, exhaustive=self.exhaustive, strict=self.strict
+            )
+            grid = subblock_local_search(
+                grid,
+                A,
+                N,
+                sqrt_N,
+                greedier=self.greedier,
+                exhaustive=self.exhaustive,
+                strict=self.strict,
+            )
+            X[i] = grid.flatten()
+        return X
+
+    @staticmethod
+    @njit
+    def _seed_numba(seed):
+        np.random.seed(seed)
 
 
 class LocalSearchRepair(Repair):
