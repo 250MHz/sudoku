@@ -476,51 +476,127 @@ class LocalSearchRepair(Repair):
 
 
 class EPLSurvival(Survival):
-    def __init__(self, n_elite: int, sampling: Sampling):
+    def __init__(
+        self,
+        n_elite: int,
+        sampling: Sampling,
+        swap_rate: float = 0.3,
+        reinit_rate: float = 0.05,
+        nudge: bool = False,
+        force_unique: bool = False,
+    ):
         super().__init__(filter_infeasible=False)
         self.n_elite = n_elite
         self.sampling = sampling
+        self.swap_rate = swap_rate
+        self.reinit_rate = reinit_rate
+        self.nudge = nudge
+        self.force_unique = force_unique
 
     def _do(
         self,
-        problem,
+        problem: "SudokuProblem",
         pop,
         n_survive=None,
         random_state: np.random.Generator = None,
         **kwargs,
     ):
-        F = pop.get("F")[:, 0]
-        idx_sorted = np.argsort(F)
+        F_all = pop.get("F")[:, 0].astype(np.int32)
+        idx_sorted = np.argsort(F_all)
+        survivors = pop[idx_sorted[:n_survive]]
 
-        elites = pop[idx_sorted[: self.n_elite]]
-        candidates = pop[idx_sorted[self.n_elite : n_survive]]
+        elites = survivors[: self.n_elite]
+        candidates = survivors[self.n_elite :]
+        n_cand = len(candidates)
 
-        new_pop_list = list(elites)
-        for ind in candidates:
-            random_elite = random_state.choice(elites)
-            f_bad = ind.F[0]
-            f_elite = random_elite.F[0]
-            p_b = (f_bad - f_elite) / f_bad if f_bad > 0 else 0
-            if random_state.random() < p_b:
-                new_pop_list.append(random_elite.copy())
+        # Pair every cand with an elite (even if it's not used later)
+        rand_elite_idx = random_state.integers(0, self.n_elite, size=n_cand)
+        matched_elites = elites[rand_elite_idx]
+
+        f_cand = candidates.get("F")[:, 0]
+        f_matched = matched_elites.get("F")[:, 0]
+
+        p_b = np.where(f_cand > 0, (f_cand - f_matched) / f_cand, 0)
+        # replace_mask are indices we'll replace with an elite
+        replace_mask = random_state.random(n_cand) < p_b
+        # reinit_mask are those that should be reinit'd
+        reinit_mask = ~replace_mask
+
+        new_X = np.zeros((n_survive, problem.n_var), dtype=np.int32)
+        new_F = np.zeros((n_survive, 1), dtype=np.int32)
+        new_X[: self.n_elite] = elites.get("X")
+        new_F[: self.n_elite] = elites.get("F")
+
+        cand_X = candidates.get("X")
+        cand_F = candidates.get("F")
+
+        if np.any(replace_mask):
+            if not self.nudge:
+                cand_X[replace_mask] = matched_elites[replace_mask].get("X")
+                cand_F[replace_mask] = matched_elites[replace_mask].get("F")
             else:
-                new_x = self.sampling._do(
-                    problem, n_samples=1, random_state=random_state
-                )[0]
-                new_ind = ind.copy()
-                new_ind.X = new_x
-                new_ind.F = None
-                new_pop_list.append(new_ind)
+                Y = matched_elites[replace_mask].get("X")
+                N = problem.N
+                A = problem.associated_matrix
+                # This is not the same as our regular mutation
+                # We break the moment a swap happens
+                for i in range(len(Y)):
+                    _grid = Y[i].reshape((N, N))
+                    for r in random_state.permutation(N):
+                        non_given_indices = np.where(~A[r])[0]
+                        if len(non_given_indices) < 2:
+                            continue
+                        if random_state.random() < self.swap_rate:
+                            a, b = random_state.choice(
+                                non_given_indices, size=2, replace=False
+                            )
+                            _grid[r, a], _grid[r, b] = _grid[r, b], _grid[r, a]
+                            break
+                        elif random_state.random() < self.reinit_rate:
+                            given_numbers = _grid[r, A[r]]
+                            missing_numbers = np.setdiff1d(
+                                np.arange(1, N + 1), given_numbers
+                            )
+                            random_state.shuffle(missing_numbers)
+                            _grid[r, ~A[r]] = missing_numbers
+                            break
+                    Y[i] = _grid.flatten()
+                cand_X[replace_mask] = Y
+                cand_F[replace_mask] = -1
 
-        new_pop = Population.create(*new_pop_list)
-        is_evaluated = np.array([ind.F is not None for ind in new_pop])
-        if not np.all(is_evaluated):
-            to_be_evaluated = new_pop[~is_evaluated]
-            X_to_eval = to_be_evaluated.get("X")
-            out = problem.evaluate(X_to_eval, return_values_of=["F"])
-            for i, ind in enumerate(to_be_evaluated):
-                ind.F = out[i]
-        return new_pop
+        n_reinit = np.sum(reinit_mask)
+        if n_reinit > 0:
+            reinit_X = self.sampling._do(
+                problem, n_samples=n_reinit, random_state=random_state
+            )
+            cand_X[reinit_mask] = reinit_X
+            cand_F[reinit_mask] = -1
+
+        new_X[self.n_elite :] = cand_X
+        new_F[self.n_elite :] = cand_F
+
+        if self.force_unique:
+            _, unique_indices = np.unique(new_X, axis=0, return_index=True)
+            is_duplicate = np.ones(n_survive, dtype=bool)
+            is_duplicate[unique_indices] = False
+            n_dupes = np.sum(is_duplicate)
+            if n_dupes > 0:
+                new_X[is_duplicate] = self.sampling._do(
+                    problem, n_samples=n_dupes, random_state=random_state
+                )
+                new_F[is_duplicate] = -1
+
+        new_pop = Population.new("X", new_X)
+        new_pop.set("F", new_F)
+        is_todo = new_F[:, 0] == -1
+        if np.any(is_todo):
+            X_todo = new_X[is_todo]
+            F_eval = problem.evaluate(X_todo, return_values_of=["F"])
+            new_F[is_todo] = F_eval.astype(np.int32)
+            new_pop.set("F", new_F)
+        idx_final = np.argsort(new_F[:, 0])
+        new_pop.set("rank", idx_final)
+        return new_pop[idx_final]
 
 
 class ZeroFunctionValueTermination(Termination):
