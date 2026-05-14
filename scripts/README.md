@@ -1,4 +1,4 @@
-`run_bench.py` does runs over the 6 puzzles in Section IV.A from [Wang et al.][1]
+`run_bench.py` does runs over the 9 puzzles in Section IV.A from [Wang et al.][1]
 `run_supplement.py` does runs over the 190 puzzles mentioend in Section IV.B
 and Section IV.C.
 
