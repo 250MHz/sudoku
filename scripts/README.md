@@ -5,8 +5,8 @@ and Section IV.C.
 Note that the scripts run with 14 parallel jobs.
 Lower the job count if your hardware doesn't support that amount.
 
-Run these scripts with [`nohup(1)`][2] to avoid crashing on `run_bench.py`
-since can take a long time:
+Run these scripts with [`nohup(1)`][2] to avoid crashing on the scripts
+since they can take a long time:
 
 ```sh
 nohup uv run run_bench.py &
@@ -16,7 +16,8 @@ nohup uv run run_supplement_bench.py &
 `run_bench.py` outputs a `ga_benchmark_results.csv` file with results.
 `run_supplement_bench.py` outputs a `ga_supplement_benchmark_results.csv`
 with results.
-The results should be identical to `.csv` files already in the repo.
+The results in terms of generations should be the same
+as the `.csv` files already in the repo.
 
 [1]: http://doi.org/10.1109/TG.2023.3236490
 [2]: https://manned.org/man/nohup
